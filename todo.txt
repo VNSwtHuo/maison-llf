@@ -1,0 +1,6 @@
+1. Proofread and mix grammar
+2. Compute SHAP RESULTS
+3. Only compute SHAP on training folds not the whole dataset
+4. Clarify dataset size inconsistency
+5. Add multi-task vs single-task comparison
+6. Verify SIS citation

@@ -9,7 +9,7 @@ from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import Dataset, DataLoader
 
-SEED         = 42
+SEED         = 42 #CHANGE THIS
 FORECAST_GAP = 7
 BATCH_SIZE   = 12
 MAX_EPOCHS   = 500
@@ -25,7 +25,7 @@ TOP_Y_VALUES = list(range(0, 8))
 
 DEVICE   = torch.device("cuda" if torch.cuda.is_available() else "mps")
 DATA_DIR = Path(__file__).parent
-SHAP_DIR = DATA_DIR / "catboost-shap"
+SHAP_DIR = DATA_DIR / f"catboost-shap{SEED}"
 
 sis_targets = [f"sis-{i:02d}" for i in range(1, 7)]
 ohs_targets = [f"ohs-{i:02d}" for i in range(1, 13)]
@@ -121,13 +121,13 @@ example_index = pd.DataFrame([
     for e in examples
 ])
 
-all_patients = np.array(sorted(example_index["patient"].unique()))
-rng          = np.random.default_rng(SEED)
-shuffled     = all_patients.copy()
-rng.shuffle(shuffled)
-train_pts    = shuffled[:12]
-val_pts      = shuffled[12:15]
-test_pts     = shuffled[15:]
+all_patients   = np.array(sorted(example_index["patient"].unique()))
+test_pts       = np.array([15, 6, 7])
+remaining_pts  = np.setdiff1d(all_patients, test_pts)
+rng            = np.random.default_rng(SEED)
+rng.shuffle(remaining_pts)
+train_pts      = remaining_pts[:12]
+val_pts        = remaining_pts[12:]
 
 
 def example_ids_for(patients) -> np.ndarray:
@@ -334,6 +334,22 @@ def run_epoch(model, optimizer, loader, training: bool) -> float:
     return total / n
 
 
+def full_metrics(rows: list) -> dict:
+    truth   = np.array([r[0] for r in rows])
+    pred    = np.array([r[1] for r in rows])
+    resid   = truth - pred
+    mae     = float(np.abs(resid).mean())
+    rmse    = float(np.sqrt((resid ** 2).mean()))
+    sst     = float(np.square(truth - truth.mean()).sum())
+    r2      = float(1 - np.square(resid).sum() / sst) if sst > 0 else float("nan")
+    pearson = (
+        float(np.corrcoef(truth, pred)[0, 1])
+        if len(truth) > 1 and np.std(truth) > 0 and np.std(pred) > 0
+        else float("nan")
+    )
+    return {"mae": mae, "rmse": rmse, "r2": r2, "pearson": pearson}
+
+
 def evaluate(model, ids: np.ndarray, sensor_stats: dict, demo_stats: dict) -> dict:
     model.eval()
     sis_item_rows, ohs_item_rows   = [], []
@@ -355,26 +371,28 @@ def evaluate(model, ids: np.ndarray, sensor_stats: dict, demo_stats: dict) -> di
                 sis_total_rows.append((float(st.sum()), float(sp.sum())))
                 ohs_total_rows.append((float(ot.sum()), float(op.sum())))
 
-    def mae_rmse(rows: list) -> tuple:
-        truth = np.array([r[0] for r in rows])
-        pred  = np.array([r[1] for r in rows])
-        resid = truth - pred
-        return float(np.abs(resid).mean()), float(np.sqrt((resid ** 2).mean()))
-
-    si_mae,  si_rmse  = mae_rmse(sis_item_rows)
-    oi_mae,  oi_rmse  = mae_rmse(ohs_item_rows)
-    st_mae,  st_rmse  = mae_rmse(sis_total_rows)
-    ot_mae,  ot_rmse  = mae_rmse(ohs_total_rows)
+    si = full_metrics(sis_item_rows)
+    oi = full_metrics(ohs_item_rows)
+    st = full_metrics(sis_total_rows)
+    ot = full_metrics(ohs_total_rows)
 
     return {
-        "sis_item_mae"  : si_mae,
-        "sis_item_rmse" : si_rmse,
-        "ohs_item_mae"  : oi_mae,
-        "ohs_item_rmse" : oi_rmse,
-        "sis_total_mae" : st_mae,
-        "sis_total_rmse": st_rmse,
-        "ohs_total_mae" : ot_mae,
-        "ohs_total_rmse": ot_rmse,
+        "sis_item_mae"    : si["mae"],
+        "sis_item_rmse"   : si["rmse"],
+        "sis_item_r2"     : si["r2"],
+        "sis_item_pearson": si["pearson"],
+        "sis_total_mae"   : st["mae"],
+        "sis_total_rmse"  : st["rmse"],
+        "sis_total_r2"    : st["r2"],
+        "sis_total_pearson": st["pearson"],
+        "ohs_item_mae"    : oi["mae"],
+        "ohs_item_rmse"   : oi["rmse"],
+        "ohs_item_r2"     : oi["r2"],
+        "ohs_item_pearson": oi["pearson"],
+        "ohs_total_mae"   : ot["mae"],
+        "ohs_total_rmse"  : ot["rmse"],
+        "ohs_total_r2"    : ot["r2"],
+        "ohs_total_pearson": ot["pearson"],
     }
 
 
@@ -402,13 +420,34 @@ def train_and_eval(split: dict) -> tuple:
         if wait >= PATIENCE:
             break
     model.load_state_dict(best_state)
-    train_metrics = evaluate(model, split["train_ids"], sensor_stats, demo_stats)
-    test_metrics  = evaluate(model, split["test_ids"],  sensor_stats, demo_stats)
-    return train_metrics, test_metrics, epoch
+    val_metrics  = evaluate(model, split["val_ids"],  sensor_stats, demo_stats)
+    test_metrics = evaluate(model, split["test_ids"], sensor_stats, demo_stats)
+    return val_metrics, test_metrics, epoch
+
+
+def fmt(m: dict, prefix: str) -> dict:
+    return {
+        f"{prefix}_sis_item_mae"     : round(m["sis_item_mae"],     4),
+        f"{prefix}_sis_item_rmse"    : round(m["sis_item_rmse"],    4),
+        f"{prefix}_sis_item_r2"      : round(m["sis_item_r2"],      4),
+        f"{prefix}_sis_item_pearson" : round(m["sis_item_pearson"], 4),
+        f"{prefix}_sis_total_mae"    : round(m["sis_total_mae"],    4),
+        f"{prefix}_sis_total_rmse"   : round(m["sis_total_rmse"],   4),
+        f"{prefix}_sis_total_r2"     : round(m["sis_total_r2"],     4),
+        f"{prefix}_sis_total_pearson": round(m["sis_total_pearson"],4),
+        f"{prefix}_ohs_item_mae"     : round(m["ohs_item_mae"],     4),
+        f"{prefix}_ohs_item_rmse"    : round(m["ohs_item_rmse"],    4),
+        f"{prefix}_ohs_item_r2"      : round(m["ohs_item_r2"],      4),
+        f"{prefix}_ohs_item_pearson" : round(m["ohs_item_pearson"], 4),
+        f"{prefix}_ohs_total_mae"    : round(m["ohs_total_mae"],    4),
+        f"{prefix}_ohs_total_rmse"   : round(m["ohs_total_rmse"],   4),
+        f"{prefix}_ohs_total_r2"     : round(m["ohs_total_r2"],     4),
+        f"{prefix}_ohs_total_pearson": round(m["ohs_total_pearson"],4),
+    }
 
 
 results   = []
-out_csv   = DATA_DIR / "search_archive_top_xy_v2_results.csv"
+out_csv   = DATA_DIR / f"seed{SEED}_search_combination_xy.csv"
 n_combos  = len(TOP_X_VALUES) * len(TOP_Y_VALUES)
 combo_idx = 0
 
@@ -435,69 +474,55 @@ for top_x in TOP_X_VALUES:
         gate_prior = ((sis_p + ohs_p) / 2).astype(np.float32)
         gate_prior = (gate_prior / gate_prior.mean()).astype(np.float32)
 
-        train_metrics, test_metrics, epochs = train_and_eval(split)
-        mean_test_item_mae  = (test_metrics["ohs_item_mae"]   + test_metrics["sis_item_mae"])   / 2.0
-        mean_train_item_mae = (train_metrics["ohs_item_mae"]  + train_metrics["sis_item_mae"])  / 2.0
-        overfit_gap         = mean_test_item_mae - mean_train_item_mae
+        val_metrics, test_metrics, epochs = train_and_eval(split)
+        rank_score = val_metrics["sis_item_mae"] + val_metrics["ohs_item_mae"]
 
         row = {
-            "top_x"                : top_x,
-            "top_y"                : top_y,
-            "n_sensor"             : len(union_sensor),
-            "n_demo"               : len(union_demo),
-            "n_features"           : n_features,
-            "test_ohs_item_mae"    : round(test_metrics["ohs_item_mae"],    4),
-            "test_ohs_item_rmse"   : round(test_metrics["ohs_item_rmse"],   4),
-            "test_sis_item_mae"    : round(test_metrics["sis_item_mae"],    4),
-            "test_sis_item_rmse"   : round(test_metrics["sis_item_rmse"],   4),
-            "test_ohs_total_mae"   : round(test_metrics["ohs_total_mae"],   4),
-            "test_ohs_total_rmse"  : round(test_metrics["ohs_total_rmse"],  4),
-            "test_sis_total_mae"   : round(test_metrics["sis_total_mae"],   4),
-            "test_sis_total_rmse"  : round(test_metrics["sis_total_rmse"],  4),
-            "train_ohs_item_mae"   : round(train_metrics["ohs_item_mae"],   4),
-            "train_ohs_item_rmse"  : round(train_metrics["ohs_item_rmse"],  4),
-            "train_sis_item_mae"   : round(train_metrics["sis_item_mae"],   4),
-            "train_sis_item_rmse"  : round(train_metrics["sis_item_rmse"],  4),
-            "mean_test_item_mae"   : round(mean_test_item_mae,  4),
-            "mean_train_item_mae"  : round(mean_train_item_mae, 4),
-            "overfit_gap"          : round(overfit_gap, 4),
-            "epochs"               : epochs,
+            "top_x"     : top_x,
+            "top_y"     : top_y,
+            "n_sensor"  : len(union_sensor),
+            "n_demo"    : len(union_demo),
+            "n_features": n_features,
+            "rank_score": round(rank_score, 4),
+            **fmt(val_metrics,  "val"),
+            **fmt(test_metrics, "test"),
+            "epochs"    : epochs,
         }
         results.append(row)
 
         print(
             f"[{combo_idx:3d}/{n_combos}] "
-            f"top_x={top_x:2d} top_y={top_y} "
-            f"n_feat={n_features:2d} | "
-            f"TEST  OHS={test_metrics['ohs_item_mae']:.3f} SIS={test_metrics['sis_item_mae']:.3f} mean={mean_test_item_mae:.3f} | "
-            f"TRAIN OHS={train_metrics['ohs_item_mae']:.3f} SIS={train_metrics['sis_item_mae']:.3f} mean={mean_train_item_mae:.3f} | "
-            f"gap={overfit_gap:+.3f} (ep={epochs})"
+            f"top_x={top_x:2d} top_y={top_y} n_feat={n_features:2d} | "
+            f"VAL  SIS={val_metrics['sis_item_mae']:.3f} OHS={val_metrics['ohs_item_mae']:.3f} rank={rank_score:.3f} | "
+            f"TEST SIS={test_metrics['sis_item_mae']:.3f} OHS={test_metrics['ohs_item_mae']:.3f} "
+            f"(ep={epochs})"
         )
 
-        pd.DataFrame(results).sort_values("mean_test_item_mae").reset_index(drop=True).to_csv(out_csv, index=False)
+        pd.DataFrame(results).sort_values("rank_score").reset_index(drop=True).to_csv(out_csv, index=False)
 
-results_df = pd.DataFrame(results).sort_values("mean_test_item_mae").reset_index(drop=True)
+results_df = pd.DataFrame(results).sort_values("rank_score").reset_index(drop=True)
 results_df.to_csv(out_csv, index=False)
 
 print()
 print("=" * 70)
 print(f"Results saved → {out_csv}")
 print()
-print("=== Top 10 by mean test per-item MAE ===")
-print(results_df.head(10)[
-    ["top_x", "top_y", "n_features",
-     "mean_test_item_mae", "mean_train_item_mae", "overfit_gap",
-     "test_ohs_item_mae", "test_sis_item_mae",
-     "train_ohs_item_mae", "train_sis_item_mae",
-     "epochs"]
-].to_string(index=False))
+display_cols = [
+    "top_x", "top_y", "n_features", "rank_score",
+    "val_sis_item_mae", "val_ohs_item_mae",
+    "test_sis_item_mae", "test_ohs_item_mae",
+    "test_sis_item_pearson", "test_ohs_item_pearson",
+    "epochs",
+]
+print("=== Top 10 by val per-item SIS MAE + OHS MAE ===")
+print(results_df.head(10)[display_cols].to_string(index=False))
 print()
 best = results_df.iloc[0]
 print(
     f"BEST  TOP_X_SENSOR={int(best['top_x'])}  "
     f"TOP_Y_DEMO={int(best['top_y'])}  "
     f"n_features={int(best['n_features'])}  "
-    f"mean_test_item_MAE={best['mean_test_item_mae']:.4f}  "
-    f"mean_train_item_MAE={best['mean_train_item_mae']:.4f}  "
-    f"gap={best['overfit_gap']:+.4f}"
+    f"rank_score(val)={best['rank_score']:.4f}  "
+    f"test_SIS_item_MAE={best['test_sis_item_mae']:.4f}  "
+    f"test_OHS_item_MAE={best['test_ohs_item_mae']:.4f}"
 )

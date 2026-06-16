@@ -9,7 +9,7 @@ from torch import nn
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from torch.utils.data import Dataset, DataLoader
 
-SEED         = 42 #CHANGE THIS
+SEED         = 1399
 FORECAST_GAP = 7
 BATCH_SIZE   = 12
 MAX_EPOCHS   = 500
@@ -35,7 +35,6 @@ union_demo:   list       = []
 n_features:   int        = 0
 gate_prior:   np.ndarray = np.empty(0)
 
-
 def seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -44,11 +43,9 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 def ordered_union(a: list, b: list) -> list:
     seen = set(a)
     return a + [x for x in b if x not in seen]
-
 
 seed_everything(SEED)
 print(f"Device: {DEVICE}")
@@ -91,7 +88,6 @@ for col in [c for c in demo_raw.columns if c != "participant" and pd.api.types.i
     demo_encoded[col] = demo_raw[col].astype(float)
 demo_lookup = demo_encoded.set_index("participant").astype(float)
 
-
 def build_forecast_examples(features_df: pd.DataFrame, demo_lkp: pd.DataFrame, gap_days: int) -> list:
     examples = []
     for patient, pdf in features_df.groupby("participant", sort=True):
@@ -114,7 +110,6 @@ def build_forecast_examples(features_df: pd.DataFrame, demo_lkp: pd.DataFrame, g
             })
     return examples
 
-
 examples      = build_forecast_examples(raw, demo_lookup, FORECAST_GAP)
 example_index = pd.DataFrame([
     {"patient": e["patient"], "clinical_time": e["clinical_time"]}
@@ -129,10 +124,8 @@ rng.shuffle(remaining_pts)
 train_pts      = remaining_pts[:12]
 val_pts        = remaining_pts[12:]
 
-
 def example_ids_for(patients) -> np.ndarray:
     return np.flatnonzero(example_index["patient"].isin(patients).to_numpy())
-
 
 split = {
     "train_ids"     : example_ids_for(train_pts),
@@ -140,7 +133,6 @@ split = {
     "test_ids"      : example_ids_for(test_pts),
     "train_patients": train_pts.tolist(),
 }
-
 
 def compute_sensor_stats(train_ids: np.ndarray) -> dict:
     frames  = pd.concat(
@@ -153,7 +145,6 @@ def compute_sensor_stats(train_ids: np.ndarray) -> dict:
     std     = imputed.std(ddof=0).replace(0, 1.0).fillna(1.0)
     return {"median": median, "mean": mean, "std": std}
 
-
 def compute_demo_stats(train_patients: list) -> dict:
     if not union_demo:
         return {"mean": pd.Series(dtype=float), "std": pd.Series(dtype=float)}
@@ -161,7 +152,6 @@ def compute_demo_stats(train_patients: list) -> dict:
     mean = dt.mean()
     std  = dt.std(ddof=0).replace(0, 1.0).fillna(1.0)
     return {"mean": mean, "std": std}
-
 
 def transform_inputs(example: dict, sensor_stats: dict, demo_stats: dict) -> np.ndarray:
     T      = len(example["timestamps"])
@@ -173,7 +163,6 @@ def transform_inputs(example: dict, sensor_stats: dict, demo_stats: dict) -> np.
     d_norm  = ((d_vals - demo_stats["mean"].to_numpy()) / demo_stats["std"].to_numpy()).astype(np.float32)
     d_tiled = np.tile(d_norm, (T, 1))
     return np.concatenate([s_norm, d_tiled], axis=1)
-
 
 class ForecastDataset(Dataset):
     def __init__(self, records: list, ids: np.ndarray, sensor_stats: dict, demo_stats: dict):
@@ -192,7 +181,6 @@ class ForecastDataset(Dataset):
             "sis": torch.tensor(e["sis"].tolist(), dtype=torch.float32),
             "ohs": torch.tensor(e["ohs"].tolist(), dtype=torch.float32),
         }
-
 
 def make_collate_fn(n_feat: int):
     def collate_fn(batch: list) -> dict:
@@ -213,7 +201,6 @@ def make_collate_fn(n_feat: int):
         }
     return collate_fn
 
-
 def make_loader(ids: np.ndarray, sensor_stats: dict, demo_stats: dict, shuffle: bool) -> DataLoader:
     return DataLoader(
         ForecastDataset(examples, ids, sensor_stats, demo_stats),
@@ -222,11 +209,9 @@ def make_loader(ids: np.ndarray, sensor_stats: dict, demo_stats: dict, shuffle: 
         collate_fn=make_collate_fn(n_features),
     )
 
-
 def inverse_softplus(x: np.ndarray) -> torch.Tensor:
     t = torch.tensor(np.asarray(x).tolist(), dtype=torch.float32).clamp_min(1e-4)
     return torch.log(torch.expm1(t))
-
 
 class FeatureGate(nn.Module):
     def __init__(self, prior: np.ndarray):
@@ -237,7 +222,6 @@ class FeatureGate(nn.Module):
         weights = torch.nn.functional.softplus(self.raw)
         weights = weights / weights.mean().clamp_min(1e-6)
         return x * weights, weights
-
 
 class DecayAttention(nn.Module):
     def __init__(self, hidden_dim: int, decay_rate: float):
@@ -260,7 +244,6 @@ class DecayAttention(nn.Module):
         attn   = torch.softmax(logits, dim=1)
         ctx    = torch.bmm(attn.unsqueeze(1), encoded).squeeze(1)
         return ctx, attn, decay
-
 
 class MaisonTemporalForecaster(nn.Module):
     def __init__(self, n_feat: int, gate_p: np.ndarray, hidden_dim: int,
@@ -298,23 +281,18 @@ class MaisonTemporalForecaster(nn.Module):
             "ohs": self.ohs_head(ohs_ctx),
         }
 
-
 def make_model() -> MaisonTemporalForecaster:
     return MaisonTemporalForecaster(
         n_features, gate_prior, HIDDEN_DIM, DROPOUT, DECAY_RATE
     ).to(DEVICE)
 
-
 _loss_fn = nn.SmoothL1Loss()
-
 
 def task_loss(output: dict, batch: dict) -> torch.Tensor:
     return _loss_fn(output["sis"], batch["sis"]) + _loss_fn(output["ohs"], batch["ohs"])
 
-
 def move_batch(batch: dict) -> dict:
     return {k: v.to(DEVICE) if torch.is_tensor(v) else v for k, v in batch.items()}
-
 
 def run_epoch(model, optimizer, loader, training: bool) -> float:
     model.train(training)
@@ -333,7 +311,6 @@ def run_epoch(model, optimizer, loader, training: bool) -> float:
         n     += len(batch["x"])
     return total / n
 
-
 def full_metrics(rows: list) -> dict:
     truth   = np.array([r[0] for r in rows])
     pred    = np.array([r[1] for r in rows])
@@ -348,7 +325,6 @@ def full_metrics(rows: list) -> dict:
         else float("nan")
     )
     return {"mae": mae, "rmse": rmse, "r2": r2, "pearson": pearson}
-
 
 def evaluate(model, ids: np.ndarray, sensor_stats: dict, demo_stats: dict) -> dict:
     model.eval()
@@ -395,7 +371,6 @@ def evaluate(model, ids: np.ndarray, sensor_stats: dict, demo_stats: dict) -> di
         "ohs_total_pearson": ot["pearson"],
     }
 
-
 def train_and_eval(split: dict) -> tuple:
     seed_everything(SEED)
     sensor_stats = compute_sensor_stats(split["train_ids"])
@@ -424,7 +399,6 @@ def train_and_eval(split: dict) -> tuple:
     test_metrics = evaluate(model, split["test_ids"], sensor_stats, demo_stats)
     return val_metrics, test_metrics, epoch
 
-
 def fmt(m: dict, prefix: str) -> dict:
     return {
         f"{prefix}_sis_item_mae"     : round(m["sis_item_mae"],     4),
@@ -444,7 +418,6 @@ def fmt(m: dict, prefix: str) -> dict:
         f"{prefix}_ohs_total_r2"     : round(m["ohs_total_r2"],     4),
         f"{prefix}_ohs_total_pearson": round(m["ohs_total_pearson"],4),
     }
-
 
 results   = []
 out_csv   = DATA_DIR / f"seed{SEED}_search_combination_xy.csv"
